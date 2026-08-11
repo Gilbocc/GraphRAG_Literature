@@ -1,0 +1,12 @@
+.venv/
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# PDFs are fetched, not committed; see data/papers/SOURCES.md
+# data/papers/*.pdf
+# Derived from the PDFs and rebuilt on demand
+# data/docling_cache/
+# data/parsed/
