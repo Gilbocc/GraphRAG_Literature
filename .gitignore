@@ -10,3 +10,4 @@ __pycache__/
 # Derived from the PDFs and rebuilt on demand
 # data/docling_cache/
 # data/parsed/
+data/logs/

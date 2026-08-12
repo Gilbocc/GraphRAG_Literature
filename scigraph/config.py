@@ -77,6 +77,47 @@ class Config:
         default_factory=lambda: float(os.getenv("LLM_TIMEOUT", "120"))
     )
 
+    # --- Querying ---
+    # Extraction and answering are different jobs. Extraction fills a fixed JSON
+    # schema from one chunk, where a small fast model at temperature 0 is right
+    # and the bill is one call per chunk per pass. Answering synthesises a dozen
+    # passages across papers into cited prose, happens a handful of times, and
+    # is where a stronger model is worth paying for. These override the
+    # extraction settings above; each falls back to it when unset.
+    #
+    # Mind OPENROUTER_PROVIDER_ORDER: it is pinned to groq, which serves
+    # gpt-oss only. Naming a query model from another family without also
+    # setting QUERY_PROVIDER_ORDER (blank is fine) routes to a provider that
+    # cannot serve it.
+    query_llm_model: str | None = field(
+        default_factory=lambda: os.getenv("QUERY_LLM_MODEL")
+    )
+    query_reasoning_effort: str | None = field(
+        default_factory=lambda: os.getenv("QUERY_REASONING_EFFORT")
+    )
+    query_provider_order: str | None = field(
+        default_factory=lambda: os.getenv("QUERY_PROVIDER_ORDER")
+    )
+    # Answering stays deterministic by default: a citation that changes between
+    # runs is not checkable. Raise it only to sample phrasings deliberately.
+    query_temperature: float = field(
+        default_factory=lambda: float(os.getenv("QUERY_TEMPERATURE", "0.0"))
+    )
+
+    @property
+    def answer_model(self) -> str:
+        return self.query_llm_model or self.llm_model
+
+    @property
+    def answer_reasoning_effort(self) -> str:
+        effort = self.query_reasoning_effort
+        return self.llm_reasoning_effort if effort is None else effort
+
+    @property
+    def answer_provider_order(self) -> str:
+        order = self.query_provider_order
+        return self.openrouter_provider_order if order is None else order
+
     extract_concurrency: int = field(
         default_factory=lambda: int(os.getenv("EXTRACT_CONCURRENCY", "8"))
     )
@@ -113,23 +154,42 @@ class Config:
     community_algorithm: str = field(
         default_factory=lambda: os.getenv("COMMUNITY_ALGORITHM", "leiden")  # leiden | louvain
     )
-    # Leiden resolution. Below 1.0 yields fewer, larger communities; at the
-    # default 1.0 a 131-concept graph fragmented into 19 communities for 5
-    # papers, half of them with <=4 members.
+    # Leiden resolution, which now sets the granularity of the finest level
+    # only. It used to matter a great deal, because detection kept just the
+    # last level Leiden produced — the fully merged one — and at ten papers
+    # that was one 89-claim group spanning nine of them. Raising gamma to force
+    # that level apart worked but flattened the hierarchy: at 2.4 the levels
+    # came out near-identical, leaving nothing to choose between.
+    #
+    # Keeping the intermediate levels makes low values better, not worse: at
+    # 0.6 the middle levels separate cleanly into 16 fine themes and 7 broad
+    # ones, which is the range worth retrieving over.
     community_resolution: float = field(
         default_factory=lambda: float(os.getenv("COMMUNITY_RESOLUTION", "0.6"))
+    )
+    # Leiden is randomised; without a fixed seed the same graph partitions
+    # differently every run, and the difference is amplified by
+    # min_community_size below, which discards whatever ends up too small.
+    community_seed: int = field(
+        default_factory=lambda: int(os.getenv("COMMUNITY_SEED", "42"))
     )
     min_community_size: int = field(
         default_factory=lambda: int(os.getenv("MIN_COMMUNITY_SIZE", "4"))
     )
 
 
-def provider_routing(cfg: Config) -> dict | None:
-    """OpenRouter `provider` routing block, or None when unpinned."""
-    order = [p.strip() for p in cfg.openrouter_provider_order.split(",") if p.strip()]
-    if not order:
+def provider_routing(cfg: Config, order: str | None = None) -> dict | None:
+    """OpenRouter `provider` routing block, or None when unpinned.
+
+    `order` defaults to the extraction pin; pass `cfg.answer_provider_order` for
+    the query path, which may name a different model on a different provider.
+    """
+    if order is None:
+        order = cfg.openrouter_provider_order
+    providers = [p.strip() for p in order.split(",") if p.strip()]
+    if not providers:
         return None
-    return {"order": order, "allow_fallbacks": cfg.openrouter_allow_fallbacks}
+    return {"order": providers, "allow_fallbacks": cfg.openrouter_allow_fallbacks}
 
 
 def load_config() -> Config:

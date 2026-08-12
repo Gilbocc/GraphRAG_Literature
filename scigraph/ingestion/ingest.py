@@ -263,27 +263,69 @@ def _key(text: str) -> str:
 def _describe_datasets(
     store: GraphStore, parsed: ParsedPaper, llm: StructuredLLM
 ) -> int:
-    """Record what the paper says about each dataset its numbers came from."""
-    log.info("  describing datasets (one call over the whole paper)")
-    try:
-        found = px.describe_datasets(llm, parsed)
-    except Exception as exc:
-        log.warning("Dataset descriptions failed for %s: %s",
-                    parsed.paper.paper_id, exc)
+    """Record what the paper says about each dataset its numbers came from.
+
+    Sequential over the paper's data-bearing sections, for the same reason the
+    subclaim pass is sequential: each call sees everything found before it, so
+    a section that merely mentions a known dataset returns nothing, and one that
+    adds detail returns that dataset again with the fuller record. The model
+    reconciles, because only the model can see both the running record and the
+    section — matching names in Python afterwards would leave one dataset as
+    three nodes holding a third of the paper's account each.
+    """
+    sections = px.dataset_sections(parsed)
+    if not sections:
+        log.info("  no data-bearing sections found")
         return 0
 
-    rows = []
-    for d in found.datasets:
-        name = d.name.strip()
-        if not name:
+    found: list[dict] = []
+    started = time.monotonic()
+    for position, (title, text) in enumerate(sections, start=1):
+        try:
+            reply = px.describe_datasets_in(llm, parsed, title, text, found)
+        except Exception as exc:
+            log.warning("  datasets %d/%d failed (%s): %s",
+                        position, len(sections), title[:40], exc)
             continue
-        rows.append({
-            "paper_id": parsed.paper.paper_id, "name": name,
-            "key": _key(name), "description": d.description[:600],
-            "size": d.size, "language": d.language, "domain": d.domain,
-            "source": d.source, "supporting_text": d.supporting_text[:400],
-            "introduced_here": d.introduced_here,
-        })
+
+        added = updated = 0
+        for d in reply.datasets:
+            name = d.name.strip()
+            if not name:
+                continue
+            record = {
+                # 600 was sized for a single pass over the whole paper. Read
+                # section by section the description gets fuller, and the cap
+                # was cutting it mid-word ("chronologically split into traini").
+                "name": name, "description": d.description[:1500],
+                "size": d.size, "language": d.language, "domain": d.domain,
+                "source": d.source, "supporting_text": d.supporting_text[:400],
+                "introduced_here": d.introduced_here,
+            }
+            if 0 <= d.existing_index < len(found):
+                # A paper says it built a dataset once, in the abstract or the
+                # section introducing it; every later section merely uses it.
+                # Since an enrichment replaces the record whole, letting a
+                # Results section clear this flag turned MultiEURLEX — a
+                # dataset named in its own paper's title — into a reused one.
+                record["introduced_here"] = (
+                    record["introduced_here"]
+                    or found[d.existing_index]["introduced_here"]
+                )
+                found[d.existing_index] = record
+                updated += 1
+            else:
+                found.append(record)
+                added += 1
+
+        log.info("  datasets %d/%d  (+%d new, %d enriched, %d known, %.0fs)  %s",
+                 position, len(sections), added, updated, len(found),
+                 time.monotonic() - started, title[:44])
+
+    rows = [
+        {**r, "paper_id": parsed.paper.paper_id, "key": _key(r["name"])}
+        for r in found
+    ]
     store.write_datasets(rows)
     return len(rows)
 
@@ -414,5 +456,9 @@ def ingest_directory(store: GraphStore, cfg: Config, directory: Path) -> dict[st
         totals["papers"] += 1
         for key, value in stats.items():
             totals[key] = totals.get(key, 0) + value
-    store.build_claim_graph()
+    # The cross-paper claim graph is NOT built here. It is a kNN over claim
+    # embeddings, and nothing is embedded until `embed` runs after this — so
+    # building it now would link only the claims already in the graph and skip
+    # every claim this run just created. It belongs with community detection,
+    # which is what consumes it.
     return totals

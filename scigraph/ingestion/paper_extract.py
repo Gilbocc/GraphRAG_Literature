@@ -404,9 +404,24 @@ def find_evidence(
 
 
 DATASET_PROMPT = """\
-You are given a paper. List the datasets and benchmarks it evaluates on or
-introduces, and write, for each, what someone would need to know to interpret a
-result reported on it — without having read this paper.
+You are reading ONE SECTION of a paper, and you already know the datasets found
+in the sections before it, with everything recorded about each so far.
+
+Return a dataset only when this section changes what is known:
+
+  - A dataset not on the list at all: return it with existing_index = -1.
+  - A dataset already on the list, where this section adds something the record
+    is missing or gets wrong: return it with existing_index set to its position
+    on the list, and fill in EVERY field — the ones already known as well as
+    the ones you are adding. What you return replaces the record entirely, so
+    anything you leave out is lost. Never return a shorter description than the
+    one already recorded.
+  - A dataset already on the list that this section adds nothing to: leave it
+    out. Most sections mention datasets without adding anything.
+
+Names change across a paper — "CUAD", "the Contract Understanding Atticus
+Dataset", "our dataset", "the corpus" all name one thing. Match on what is
+being described, not on the string.
 
 `description` is the important field. Say what the examples actually are, what
 the model is asked to do, and what a correct answer looks like. Write it so a
@@ -423,23 +438,72 @@ Never write a description that would fit any dataset in the field. If the paper
 does not say enough to write a real one, say what it does say and leave it
 short rather than padding it with generic phrasing.
 
-The other fields: whether THIS paper introduces it or reuses something that
-already existed, its size, language, legal domain or jurisdiction, and where the
+The other fields: `introduced_here` is true when THIS paper builds or releases
+the dataset — check the title and abstract, not just the section in front of
+you, because a paper introducing a dataset spends most of its sections simply
+using it. It is false only for data that existed before this paper. Then its size, language, legal domain or jurisdiction, and where the
 data came from — a prior dataset, a court, an exam board, a government
 database. Take all of it from the paper; leave a field empty rather than
 supplying knowledge from elsewhere.
 
-`supporting_text` must be a verbatim span from the paper describing it.
+`supporting_text` must be a verbatim span from THIS section describing it.
 
 Include a dataset only if this paper actually evaluates on it or builds it.
 Datasets mentioned only as prior work someone else used do not belong here.
 """
 
 
-def describe_datasets(llm: StructuredLLM, parsed: ParsedPaper) -> DatasetDetails:
-    """The datasets this paper uses or introduces, read from the paper itself."""
-    return llm.parse(
-        DATASET_PROMPT, _header(parsed) + claim_text(parsed)[:60000], DatasetDetails)
+# Sections that describe data. Every other pass reads a bounded slice of the
+# paper; this one used to send the whole paper in a single request, which made
+# it both the largest call in the pipeline and the one that hung — sixteen
+# minutes on a 60k-character prompt, with the socket timeout unable to bound it.
+DATA_SECTION = re.compile(
+    r"data|dataset|corpus|benchmark|task|experiment|setup|evaluat|abstract|"
+    r"introduction|resource|annotat",
+    re.I,
+)
+MAX_DATASET_CHARS = 8000
+
+
+def dataset_sections(parsed: ParsedPaper) -> list[tuple[str, str]]:
+    """Body sections likely to describe data, each bounded to one small call."""
+    out = []
+    for title, text in _body_sections(parsed):
+        if not DATA_SECTION.search(title):
+            continue
+        text = text.strip()
+        if text:
+            out.append((title, text[:MAX_DATASET_CHARS]))
+    return out
+
+
+def _known_datasets(known: list[dict]) -> str:
+    """The running record, as the model needs to see it to add to it."""
+    if not known:
+        return "Datasets found so far: (none yet — this is the first section)\n"
+    lines = ["Datasets found so far:"]
+    for index, d in enumerate(known):
+        lines.append(
+            f"[{index}] {d['name']}"
+            f"\n     description: {d.get('description') or '(missing)'}"
+            f"\n     size: {d.get('size') or '(missing)'}"
+            f" | language: {d.get('language') or '(missing)'}"
+            f" | domain: {d.get('domain') or '(missing)'}"
+            f" | source: {d.get('source') or '(missing)'}"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def describe_datasets_in(
+    llm: StructuredLLM, parsed: ParsedPaper, title: str, text: str,
+    known: list[dict],
+) -> DatasetDetails:
+    """Datasets this section adds to what is already known."""
+    user = (
+        f"{_header(parsed)}{_known_datasets(known)}\n"
+        f"SECTION — {title}\n{text}\n"
+    )
+    return llm.parse(DATASET_PROMPT, user, DatasetDetails)
 
 
 def verify_claim(llm: StructuredLLM, claim: str, evidence: list[str]) -> ClaimVerdict:

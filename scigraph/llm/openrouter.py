@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from typing import Any, TypeVar
 
 import neo4j
@@ -43,11 +44,17 @@ def embedder(cfg: Config) -> OpenAIEmbeddings:
 
 
 def graphrag_llm(cfg: Config) -> OpenAILLM:
-    """neo4j-graphrag LLM used for answer generation in GraphRAG pipelines."""
+    """The answering model — QUERY_LLM_MODEL and friends, or the extraction one.
+
+    Answering is a different job from extraction: a dozen passages synthesised
+    into cited prose, a handful of times, rather than one JSON object per chunk
+    thousands of times. It is worth being able to point it at a stronger model
+    without changing what ingest costs.
+    """
     extra_body: dict[str, Any] = {}
-    if cfg.llm_reasoning_effort:
-        extra_body["reasoning"] = {"effort": cfg.llm_reasoning_effort}
-    routing = provider_routing(cfg)
+    if cfg.answer_reasoning_effort:
+        extra_body["reasoning"] = {"effort": cfg.answer_reasoning_effort}
+    routing = provider_routing(cfg, cfg.answer_provider_order)
     if routing:
         extra_body["provider"] = routing
     # The timeout matters as much here as on the extraction client: a request
@@ -55,8 +62,11 @@ def graphrag_llm(cfg: Config) -> OpenAILLM:
     # indistinguishable from a slow one. **kwargs reaches the underlying
     # OpenAI client.
     return OpenAILLM(
-        model_name=cfg.llm_model,
-        model_params={"temperature": 0.0, "extra_body": extra_body or None},
+        model_name=cfg.answer_model,
+        model_params={
+            "temperature": cfg.query_temperature,
+            "extra_body": extra_body or None,
+        },
         api_key=cfg.openrouter_api_key,
         base_url=OPENROUTER_BASE_URL,
         timeout=cfg.llm_timeout,
@@ -78,6 +88,18 @@ def raw_client(cfg: Config) -> OpenAI:
 # few seconds, so anything past this is contention, a retry, or a stall.
 SLOW_CALL_SECONDS = 20.0
 
+# The OpenAI client's `timeout` is per socket operation, not a deadline for the
+# whole request: a server that holds the connection open and trickles bytes
+# resets the read timer forever, and the call never returns. One dataset pass
+# sat blocked for sixteen minutes on a 60k-character prompt with no error, no
+# retry and no log line, which is the same indistinguishable-from-a-hang
+# failure the timeout was added to prevent.
+#
+# So the request also runs under a wall-clock deadline enforced from outside.
+# The abandoned thread cannot be cancelled -- it dies with the process -- but
+# control returns, the attempt is logged, and the retry can proceed.
+HARD_DEADLINE_FACTOR = 3.0
+
 
 class StructuredLLM:
     """Calls OpenRouter and validates the reply against a Pydantic model.
@@ -89,6 +111,8 @@ class StructuredLLM:
 
     def __init__(self, cfg: Config) -> None:
         self.client = raw_client(cfg)
+        self._pool = ThreadPoolExecutor(max_workers=1)
+        self.deadline = cfg.llm_timeout * HARD_DEADLINE_FACTOR
         self.calls = 0
         self.seconds = 0.0
         self.model = cfg.llm_model
@@ -101,7 +125,8 @@ class StructuredLLM:
         if routing:
             self.extra_body["provider"] = routing
 
-    def parse(self, system: str, user: str, schema: type[T], *, max_retries: int = 2) -> T:
+    def parse(self, system: str, user: str, schema: type[T], *,
+              max_retries: int = 2, max_tokens: int | None = None) -> T:
         """Call the model and validate the reply, timing every attempt.
 
         Timing lives here because it is the only place every call passes
@@ -109,6 +134,12 @@ class StructuredLLM:
         ble from one that is stuck, and both look like silence.
         """
         started = time.monotonic()
+        # The budget is reserved, not billed by use: this provider queues a
+        # request against the max_tokens it asks for, whatever it returns.
+        # Measured back to back on one summary-sized prompt returning ~50
+        # tokens: 8.9s at 32000, 0.2s at 800. So a caller that knows its reply
+        # is short says so, and only extraction pays for the headroom it needs.
+        budget = max_tokens or self.max_tokens
         json_schema = schema.model_json_schema()
         messages = [
             {"role": "system", "content": system},
@@ -144,18 +175,28 @@ class StructuredLLM:
                 ]
 
             try:
-                resp = self.client.chat.completions.create(
+                future = self._pool.submit(
+                    self.client.chat.completions.create,
                     model=self.model,
                     messages=messages,
                     temperature=0.0,
-                    max_tokens=self.max_tokens,
+                    max_tokens=budget,
                     extra_body=self.extra_body or None,
                     **kwargs,
                 )
+                try:
+                    resp = future.result(timeout=self.deadline)
+                except FutureTimeout:
+                    future.cancel()
+                    raise TimeoutError(
+                        f"no response in {self.deadline:.0f}s "
+                        f"({len(system) + len(user)} prompt chars); the socket "
+                        f"timeout does not bound a trickling response"
+                    ) from None
                 choice = resp.choices[0]
                 if choice.finish_reason == "length":
                     raise ValueError(
-                        f"response hit max_tokens ({self.max_tokens}); raise LLM_MAX_TOKENS"
+                        f"response hit max_tokens ({budget}); raise LLM_MAX_TOKENS"
                     )
                 content = choice.message.content or ""
                 parsed = schema.model_validate_json(_strip_fences(content))
@@ -171,7 +212,7 @@ class StructuredLLM:
                 else:
                     log.debug("%s in %.1fs", schema.__name__, elapsed)
                 return parsed
-            except (ValidationError, json.JSONDecodeError, ValueError) as exc:
+            except (ValidationError, json.JSONDecodeError, ValueError, TimeoutError) as exc:
                 last_error = exc
                 log.warning("Structured parse failed (attempt %d): %s", attempt + 1, exc)
             except Exception as exc:  # transport / unsupported response_format

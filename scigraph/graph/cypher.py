@@ -34,6 +34,7 @@ VECTOR_INDEXES = {
     "chunk_embeddings": ("Chunk", "embedding"),
     "claim_embeddings": ("Claim", "embedding"),
     "community_embeddings": ("Community", "embedding"),
+    "evidence_embeddings": ("Evidence", "embedding"),
 }
 
 SHOW_VECTOR_INDEXES = (
@@ -42,6 +43,30 @@ SHOW_VECTOR_INDEXES = (
 DROP_INDEX = "DROP INDEX {name} IF EXISTS"
 CLEAR_EMBEDDINGS = "MATCH (n) WHERE n.embedding IS NOT NULL REMOVE n.embedding"
 WIPE = "MATCH (n) CALL (n) { DETACH DELETE n } IN TRANSACTIONS OF 10000 ROWS"
+
+# Everything one paper contributed, so it can be ingested again from clean.
+#
+# Needed because an interrupted ingest leaves a half-extracted paper, and
+# re-running does not repair it: claim ids hash the claim's own text, so an
+# identical claim re-merges but a re-worded one lands as a second node beside
+# the first. Re-ingesting on top silently doubles part of a paper.
+#
+# The Paper node itself stays. Ingest MERGEs it by id regardless, and keeping
+# it preserves the CITES edges other papers' reference lists point at it.
+# Datasets are shared, so only those left with no other paper go.
+DELETE_PAPER_CONTENT = """
+MATCH (p:Paper {paper_id: $paper_id})
+OPTIONAL MATCH (p)-[:MAKES_CLAIM]->(cl:Claim)
+OPTIONAL MATCH (cl)-[:SUPPORTED_BY]->(ev:Evidence)
+OPTIONAL MATCH (p)-[:HAS_SECTION]->(sec:Section)-[:HAS_CHUNK]->(ch:Chunk)
+WITH p, collect(DISTINCT cl) + collect(DISTINCT ev)
+      + collect(DISTINCT sec) + collect(DISTINCT ch) AS doomed
+FOREACH (n IN doomed | DETACH DELETE n)
+WITH p
+OPTIONAL MATCH (p)-[:USES_DATASET]->(d:Dataset)
+WHERE NOT EXISTS { MATCH (other:Paper)-[:USES_DATASET]->(d) WHERE other <> p }
+DETACH DELETE d
+"""
 
 # ------------------------------------------------------------------ documents
 
@@ -197,7 +222,15 @@ CALL (a) {
 }
 WITH a, b, score WHERE elementId(a) < elementId(b)
 MERGE (a)-[r:RELATED_CLAIM]->(b)
-SET r.weight = score, r.source = 'cross_paper_knn'
+// The weight is the similarity rescaled onto the range that actually survived
+// the threshold, not the raw cosine. Every edge here scored at least
+// $min_similarity, so raw scores span 0.80-1.00 — to modularity that is a
+// nearly uniform graph, and a uniform graph has no structure to find, which is
+// how Leiden ended up cutting one topic into equal-sized halves while nominally
+// running weighted. Rescaled, a 0.98 pair outweighs a 0.81 pair roughly 9 to 1.
+SET r.weight = (score - $min_similarity) / (1.0 - $min_similarity),
+    r.similarity = score,
+    r.source = 'cross_paper_knn'
 RETURN count(*) AS created
 """
 
@@ -303,10 +336,34 @@ MATCH (c:Community) DETACH DELETE c
 RETURN count(*) AS removed
 """
 
+# Detection is deterministic, so re-running it usually reproduces the same
+# communities exactly. Deleting them all first threw away every summary anyway,
+# which made each run cost 23 LLM calls and meant an interrupted run left the
+# graph worse than it found it. This drops only what no longer exists.
+PRUNE_COMMUNITIES = """
+MATCH (c:Community) WHERE NOT c.community_id IN $ids
+DETACH DELETE c
+RETURN count(*) AS removed
+"""
+
+# A summary is only valid for the exact set of claims it was written from, so
+# membership is fingerprinted and the summary survives precisely when that
+# fingerprint does. Same claims -> keep the summary and its embedding; one claim
+# different -> the summary now describes something else, so it goes and is
+# regenerated.
 WRITE_COMMUNITIES = """
 UNWIND $rows AS row
   MERGE (c:Community {community_id: row.community_id})
-  SET c.algorithm = $algorithm, c.size = row.size, c.level = 0
+  FOREACH (_ IN CASE
+             WHEN c.members_hash IS NULL OR c.members_hash <> row.members_hash
+             THEN [1] ELSE [] END |
+    SET c.summary = NULL, c.title = NULL, c.key_themes = NULL
+    REMOVE c.embedding
+  )
+  SET c.algorithm = $algorithm, c.size = row.size, c.level = row.level,
+      c.members_hash = row.members_hash
+  WITH c, row
+  CALL (c) { MATCH (c)<-[old:IN_COMMUNITY]-() DELETE old }
   WITH c, row
   UNWIND row.members AS member_key
     MATCH (n:Claim {claim_id: member_key})
@@ -379,6 +436,18 @@ UNWIND $rows AS r
 # ----------------------------------------------------------------- embeddings
 
 # label -> (query selecting unembedded nodes, id property)
+# What text stands for each node when a question is matched against it.
+#
+# A claim is embedded bare, and it was worth trying the alternative to find out
+# why. Prefixing the paper title and section — on the theory that "performance
+# degrades sharply on longer inputs" names neither task nor model — made the
+# cross-paper kNN worse, because the prefix is near-constant within a paper and
+# long relative to one sentence. Four unrelated LEGALBENCH claims came back
+# paired to the same LawBench claim at an identical 0.905: the score was
+# measuring the prefix. Bare text recovers pairs that are actually about one
+# thing, e.g. both benchmarks excluding long-document tasks over context limits.
+# Context that discriminates *between* claims in a paper would help; metadata
+# shared by all of them does not.
 EMBED_TARGETS = {
     "Chunk": (
         "MATCH (n:Chunk) WHERE n.embedding IS NULL AND n.text IS NOT NULL "
@@ -396,7 +465,16 @@ EMBED_TARGETS = {
         "  coalesce(n.title,'') + '. ' + n.summary AS text LIMIT $limit",
         "community_id",
     ),
+    "Evidence": (
+        "MATCH (n:Evidence) WHERE n.embedding IS NULL AND n.text IS NOT NULL "
+        "RETURN n.evidence_id AS id, n.text AS text LIMIT $limit",
+        "evidence_id",
+    ),
 }
+
+# Changing what a label embeds makes the stored vectors stale, and the
+# incremental `embedding IS NULL` filter will never notice.
+CLEAR_LABEL_EMBEDDINGS = "MATCH (n:{label}) REMOVE n.embedding"
 
 WRITE_EMBEDDING = """
 UNWIND $rows AS row
@@ -496,37 +574,41 @@ ORDER BY score DESC
 # Community summaries carry no page numbers of their own, so a few grounded
 # claims are attached. Without them the model is asked for page-level citations
 # it has no data for, and fabricates them.
+# Broad themes only, and citable. This used to match `(e)<-[:ABOUT]-(cl:Claim)`
+# with `e` unbound, against a relationship that no longer exists since entities
+# were dropped: every "concept" came back empty and the citations came from a
+# cartesian product. Global answered from titles alone, which is why it either
+# invented sources or refused outright.
+#
+# {level} is filled in at build time. The vector index is shared by both
+# hierarchy levels, and the library applies its LIMIT before this query runs,
+# so callers over-fetch and this filters down.
 GLOBAL_QUERY = f"""
-MATCH (community:Community) WHERE community = node
-OPTIONAL MATCH (community)<-[:IN_COMMUNITY]-(cl2:Claim)
-OPTIONAL MATCH (e)<-[:ABOUT]-(cl:Claim)<-[:MAKES_CLAIM]-(p:Paper)
+MATCH (community:Community) WHERE community = node AND community.level = {{level}}
+OPTIONAL MATCH (community)<-[:IN_COMMUNITY]-(cl:Claim)<-[:MAKES_CLAIM]-(p:Paper)
+OPTIONAL MATCH (cl)-[:SUPPORTED_BY]->(ev:Evidence)
 WITH community, score,
-     collect(DISTINCT e.name)[..25] AS concepts,
      collect(DISTINCT p.title)[..15] AS papers,
      collect(DISTINCT
-       '  * "' + cl.text + '" [' + p.title + ', ' + cl.section +
-       ', p.' + toString(cl.page_start) + ']'
-     )[..10] AS citations
+       '  * "' + left(coalesce(ev.text, cl.text), 400) + '"' +
+       '  \u2014\u2014 CITE AS: [' + coalesce(p.title, '?') + ', ' +
+       coalesce(ev.section, cl.section, '?') +
+       ', p.' + toString(coalesce(ev.page_start, cl.page_start)) + ']'
+     )[..12] AS citations
 RETURN
   '--- THEME (similarity ' + toString(round(score, 3)) + ') ---\\n' +
   'Community: ' + coalesce(community.title, community.community_id) + '\\n' +
-  'Size: ' + toString(community.size) + ' concepts\\n' +
-  'Concepts: ' + {_join('concepts')} + '\\n' +
+  'Size: ' + toString(community.size) + ' claims\\n' +
   'Papers: ' + {_join('papers')} + '\\n' +
-  'Summary: ' + coalesce(community.summary, '(not yet summarized)') + '\\n' +
-  'Citable claims from this theme:\\n' + {_join('citations', sep=chr(92) + 'n')}
+  'Passages behind this theme:\\n' +
+  {_join('citations', sep=chr(92) + 'n')}
   AS info
 ORDER BY score DESC
+LIMIT {{limit}}
 """
 
-# --- hybrid: community framing, then the cited evidence underneath it ---------
-# A theme, and underneath it the claims that constitute it with the passage
-# behind each. Global mode answers from summaries alone, so its citations
-# resolve to a community rather than to a page and a reader cannot check them;
-# this carries the evidence through, which is the whole point of grouping
-# claims rather than chunks.
 HYBRID_QUERY = f"""
-MATCH (community:Community) WHERE community = node
+MATCH (community:Community) WHERE community = node AND community.level = {{level}}
 OPTIONAL MATCH (community)<-[:IN_COMMUNITY]-(cl:Claim)
 OPTIONAL MATCH (p:Paper)-[:MAKES_CLAIM]->(cl)
 OPTIONAL MATCH (cl)-[:SUPPORTED_BY]->(ev:Evidence)
@@ -573,7 +655,9 @@ RETURN
   {_join('evidence', sep=chr(92) + 'n')}
   AS info
 ORDER BY score DESC
+LIMIT {{limit}}
 """
+
 
 
 

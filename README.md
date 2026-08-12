@@ -54,15 +54,30 @@ PDF ─┬─ GROBID   → references, DOI/arXiv id, title      (full PDF)
                   each attached to the claim it elaborates        [sequential]
    3. evidence    every chunk × the complete claim set → span anchors  [parallel]
    4. verify      each claim vs its own spans and its children's       [parallel]
-   5. datasets    one call → what each dataset contains
+   5. datasets    data-bearing sections IN ORDER → what each dataset
+                  contains, each section enriching what is known  [sequential]
                           │
-   embed → cross-paper claim graph → communities → OpenAlex → claim links
+   embed → communities (claim graph → Leiden levels → summaries) → OpenAlex
 ```
 
 Pass 2 is sequential so each chunk sees the claims found before it — that is
 what removes the need for a dedup step. Pass 3 is parallel because the claim
 set is fixed by then, which also means every chunk is judged against every
 claim rather than only those discovered so far.
+
+Pass 5 is sequential for the same reason. It used to send the whole paper in
+one call, which made it both the largest request in the pipeline and the one
+that hung; now each data-bearing section sees the datasets already found, and
+either adds a new one or returns a fuller record for one already there. A paper
+names the same dataset several ways — "CUAD", "the Contract Understanding
+Atticus Dataset", "our dataset" — so the model reconciles them while it can see
+both, rather than leaving one dataset as three nodes holding a third of the
+account each.
+
+The cross-paper claim graph is built during `communities`, not at the end of
+ingest: it is a kNN over claim embeddings, and nothing is embedded until `embed`
+runs. Built at the end of ingest it silently skipped every claim that run had
+just created.
 
 Appendices and related work are excluded everywhere. Appendices are found
 positionally — the first lettered heading after the last numbered section —
@@ -110,24 +125,26 @@ python -m scigraph ask --plain "..."      # baseline: nearest chunks, no graph
 |---|---|
 | `plain` | nearest chunks only — the control |
 | `local` | nearest chunks, plus the claims each grounds and the paper's datasets |
-| `global` | community summaries only |
-| `hybrid` | community summaries, plus each theme's claims **and the verbatim passage behind each** |
+| `global` | **broad** community themes, with the passage behind each claim |
+| `hybrid` | **fine** community themes with their passages, **plus** the nearest chunks |
 
-**Use `hybrid`.** On a corpus of six papers it beat plain RAG on cross-paper
-synthesis, and won outright where the answer existed but was not lexically
-close to the question:
+Communities are hierarchical, and each mode reads the level it is for: `global`
+takes the broadest level for corpus-wide questions, `hybrid` the finest, since
+it gets breadth from chunks instead. Both cite the passage, not the summary.
 
-> *"How should legal LLM outputs be evaluated, and what is wrong with current
-> metrics?"*
->
-> plain: *"cannot be answered from the supplied text"*
-> local: *"the context does not contain information"*
-> hybrid: found LawBench's Limitations, p.16 — *"we only use Rouge-L … which
-> cannot fully reflect the human judgement about the answer quality"*
+**No mode wins everything.** Measured by reading answers on a ten-paper corpus:
 
-`plain` still wins when an answer sits in one paper and is lexically obvious.
-`global` cites community summaries, which have no page, so its citations cannot
-be verified — prefer `hybrid`.
+| question type | best mode | why |
+|---|---|---|
+| cross-paper disagreement | `hybrid` | only mode that connected CUAD's scaling result to LawBench's |
+| corpus-wide breadth | `global` | broadest coverage, 30 page-citations on one question |
+| "what methods exist" | `local` | reads passages closely; separated annotation from prediction where hybrid merged them |
+| single-paper factual | `plain` | its whole context is passages |
+
+`hybrid` is the default worth reaching for, because synthesis across papers is
+what the graph is for, but it spends about 70% of its context on themes and 30%
+on passages — which is the right trade for connecting claims and the wrong one
+for reading two passages closely.
 
 ### What the comparisons showed
 
@@ -140,41 +157,45 @@ newest last:
 | first | 3 papers | [`three_papers.md`](data/comparisons/three_papers.md) |
 | after two more | 5 papers | [`five_papers.md`](data/comparisons/five_papers.md) |
 | after LegalBench | 6 papers | [`six_papers.md`](data/comparisons/six_papers.md) |
-| after the citation fix | 6 papers, new questions | [`six_papers_v2.md`](data/comparisons/six_papers_v2.md) |
+| after the citation fix | 6 papers | [`six_papers_v2.md`](data/comparisons/six_papers_v2.md) |
+| four more papers, wider topics | 10 papers | [`ten_papers.md`](data/comparisons/ten_papers.md) |
+| after the record-formatting fix | 10 papers | [`ten_papers_v2.md`](data/comparisons/ten_papers_v2.md) |
+| after hierarchical levels | 10 papers | [`ten_papers_v3_levels.md`](data/comparisons/ten_papers_v3_levels.md) |
 
 What they show:
 
-- **`hybrid` wins wherever the answer is not lexically close to the question.**
-  Asked how legal LLM outputs should be evaluated, `plain` answered *"cannot be
-  answered from the supplied text"* and `local` *"the context does not contain
-  information"*; `hybrid` found LawBench's Limitations, p.16. The sentence was
-  in the corpus all along — chunk similarity could not reach it, because the
-  passage argues the point without using the question's words.
-- **`hybrid` synthesises across papers; `plain` rarely leaves one.** On "which
-  model families recur and what is claimed about each", `hybrid` produced a
-  comparison table over eight families from three papers, each row cited to a
-  section and page. `plain` answered from one paper.
-- **`plain` still wins when the answer is in one paper and obvious.** Asked
-  whether fine-tuning is worthwhile, it quoted four LawBench passages including
-  an analysis section the graph modes missed.
-- **Neither found a contradiction, and that is probably right.** Six papers
-  sharing no benchmarks or models do not disagree; `link-claims` independently
-  judged every candidate pair `UNRELATED`. Only `hybrid` demonstrated it by
-  examining the candidates rather than failing to retrieve any.
-- **`global` is not usable.** It answers from summaries alone, so its citations
-  have no page and cannot be checked; on one question it also reached the
-  opposite conclusion to `hybrid` by silently narrowing the question.
+- **The graph earns its cost on disagreement, and only once it could see one.**
+  Asked whether bigger models reliably do better on legal tasks, `hybrid` set
+  CUAD's *"a 20-fold increase in parameters for ALBERT yields only about a 3%
+  improvement in AUPR"* (Table 2, p.6) against LawBench's *"scaling up the model
+  size results in better performance in one-shot case"* (§4.4, p.13), and
+  resolved it — architecture changes help where parameter count alone does not.
+  Every other mode answered "usually helps, not always" from LawBench and
+  LEGALBENCH alone. The same question failed in all four modes two runs earlier;
+  what changed was retrieval, not the corpus.
+- **`hybrid` reaches papers the claim graph barely connects.** CUAD and
+  MultiEURLEX link weakly to the rest, so community membership alone would miss
+  them; the chunk half retrieves them anyway, with page-level citations.
+- **`plain` still wins when the answer is in one paper.** On how cross-lingual
+  legal NLP differs from English-only — essentially a MultiEURLEX question — it
+  gave the most detailed answer of any mode.
+- **`local` reads passages more closely than `hybrid`.** Asked what methods
+  extract structure from contracts, it distinguished human span annotation from
+  model span prediction and gave the matching metric (Jaccard ≥ 0.5); `hybrid`
+  merged the two.
+- **Disagreement is rare and mostly absent.** Six near-identical benchmark
+  papers produced none. Broadening the corpus to contract extraction, judgment
+  prediction, multilingual transfer and data curation produced the scaling
+  disagreement above — the graph finds what is there, and homogeneous corpora
+  have little to find.
 
-Two bugs the comparisons caught, both since fixed: `hybrid` quoting our
-paraphrased claim text as if it were the paper's words, and — after datasets
-were added to the context — citing a community title as a source. Both produced
-citations that look checkable and are not, which is the one failure this design
-exists to prevent.
-
-Context distinguishes what may be quoted from what may not: claims are labelled
-`CLAIM (our paraphrase, do not quote)` and spans `VERBATIM PASSAGE (quotable)`.
-Without that split, answers quoted our paraphrase and attributed it to a page —
-a citation that looks checkable and is not.
+Four bugs these runs caught, all since fixed, all of which produced answers that
+looked citable and were not: `hybrid` quoting our paraphrase as the paper's
+words; citing a community title as a source; `GLOBAL_QUERY` matching a
+relationship that no longer existed, so global answered from titles alone or
+refused; and the retriever handing the model `str(record)` — a Python repr with
+every newline escaped — which broke the line structure binding each quotation to
+its citation.
 
 ## Choosing what to read next
 
@@ -215,19 +236,36 @@ python -m scigraph pipeline data/papers      # everything
 # adding one paper to an existing graph — only it hits the LLM
 python -m scigraph ingest /path/to/one-paper/
 python -m scigraph embed
-python -m scigraph communities               # summaries are embedded here too
+python -m scigraph communities               # claim graph, levels, summaries, embeddings
 python -m scigraph link-claims
 
+# an interrupted ingest leaves a half-extracted paper; re-running does not
+# repair it, because claim ids hash the claim text and a re-worded claim lands
+# beside the old one. Clear it first.
+python -m scigraph forget arxiv:2103.06268
+python -m scigraph ingest /path/to/one-paper/
+
+python -m scigraph embed --redo Claim        # after changing what a label embeds
 python -m scigraph compare "q1" "q2" --out data/comparisons/run.md
 python -m scigraph export-parsed data/papers # inspect the parse, no Neo4j needed
 python -m scigraph stats
 ```
 
+Every command also appends to `data/logs/scigraph.log`, timestamped and flushed
+per line, so a long run can be watched from another shell with `tail -f`. That
+exists because piping the console output through anything that buffers hides it
+completely: an ingest once ran thirty minutes emitting progress into a pipe that
+held every line until the process exited, which is indistinguishable from a
+hang.
+
 ## Configuration
 
 | variable | default | note |
 |---|---|---|
-| `OPENROUTER_LLM_MODEL` | `openai/gpt-oss-120b` | see the model note |
+| `OPENROUTER_LLM_MODEL` | `openai/gpt-oss-120b` | extraction; see the model note |
+| `QUERY_LLM_MODEL` | *(extraction model)* | answering only — a stronger model here does not change ingest cost |
+| `QUERY_PROVIDER_ORDER` | *(extraction pin)* | **blank this if the query model is not groq-served** |
+| `QUERY_REASONING_EFFORT` / `QUERY_TEMPERATURE` | *(extraction)* / `0.0` | temperature 0 keeps citations reproducible |
 | `OPENROUTER_PROVIDER_ORDER` | `groq` | serves gpt-oss only — blank it for other models |
 | `LLM_TIMEOUT` | `120` | seconds; **without this a stalled call blocks forever** |
 | `LLM_MAX_TOKENS` | `32000` | a truncated response is discarded whole |
@@ -253,37 +291,51 @@ coverage — and the structural guarantees hold either way.
 
 ## Cost
 
-Per paper, on the six-paper corpus:
+Per paper, measured on the ten-paper corpus:
 
 ```
 legalbench (40 chunks): subclaims=216s evidence=22s verify=27s datasets=89s
                         155 LLM calls, 556s in the model
-smaller papers:         ~75s end to end, ~85 LLM calls
+multieurlex (21 chunks): subclaims=24s evidence=85s verify=13s datasets=7s
+                        77 LLM calls
+smaller papers:         ~40-90s end to end, ~50-90 LLM calls
 ```
 
-Plus one-off docling conversion, minutes per paper, cached by PDF content hash.
-The sequential sub-claim pass is the dominant cost and grows with chunk count.
+Plus one-off docling conversion — **the dominant wall-clock cost**, minutes per
+paper on CPU and cached by PDF content hash. Four uncached papers took 30
+minutes to convert and under 4 minutes to extract.
+
+Re-running `communities` on an unchanged graph is free: summaries survive when
+membership does.
 
 ## Status
 
-Working: parsing, five extraction passes, verification, cross-paper communities,
-OpenAlex enrichment, four query modes, citation suggestions.
+Working: parsing, five extraction passes, verification, hierarchical
+cross-paper communities, OpenAlex enrichment, four query modes, citation
+suggestions. Ten papers, 361 claims, 399 evidence spans, 23 communities across
+two levels.
 
 Known gaps, roughly by how much they matter:
 
-- **`link-claims` finds no contradictions**, and that is probably correct — six
-  papers sharing no benchmarks or models do not contradict each other. Untested
-  on a corpus that genuinely overlaps.
-- **Communities need a bigger, more varied corpus.** At six homogeneous papers
-  there are two or three real cross-paper themes; forcing more produces blobs.
-  The similarity floor is 0.80 for that reason.
+- **A third of claims reach no community** — 114 of 361, because they link to
+  nothing above the 0.80 floor. Lowering it destroys the communities instead, so
+  `hybrid` covers those papers through chunks rather than themes.
+- **`link-claims` finds no contradictions.** The one real cross-paper
+  disagreement in this corpus — CUAD against LawBench on whether scale helps —
+  sits at cosine 0.799, just under the pairing threshold, and was surfaced by
+  retrieval rather than by the linker. The pass has yet to earn its cost.
 - **Run-to-run variance is large** — the same paper gave 23 and 54 claims on
   different runs. Pass 2 being sequential compounds an early divergence.
+  Community *detection* is now seeded and reproducible; extraction is not.
 - **Support propagation is undiscriminating** — a parent inherits every child's
   evidence whether or not the child concerns the same proposition.
-- **`global` mode citations are unverifiable** (no page).
+- **Rate limits are invisible.** The OpenAI client retries 429s internally with
+  backoff and logs nothing, so a throttled call looks like a hang: summaries ran
+  at 5s each until the quota went, then 101s each.
 - **No tests.** They were deleted during the schema rework and should return —
-  docling and GROBID behaviour is load-bearing and unpinned.
+  docling and GROBID behaviour is load-bearing and unpinned, and four of the
+  bugs found this week were schema drift that a single query-parse test would
+  have caught.
 
 ## Stack and parameters
 
@@ -314,30 +366,48 @@ with an embedded schema — not every OpenRouter-routed model supports the forme
 
 ### What gets embedded
 
-Three node types, all with `openai/text-embedding-3-small`, 1536 dims, 128
-texts per request. Embedding is incremental (`WHERE n.embedding IS NULL`), so
-re-running `embed` only touches new nodes.
+All with `openai/text-embedding-3-small`, 1536 dims, 128 texts per request.
+Embedding is incremental (`WHERE n.embedding IS NULL`), so re-running `embed`
+only touches new nodes; `embed --redo Claim` drops a label's vectors first, for
+when the embedded *text* changed and the incremental filter would skip them.
 
 | node | text embedded | what it powers |
 |---|---|---|
 | `Chunk` | the raw passage, up to ~4000 chars — a table chunk is the whole table | `plain` and `local` retrieval |
-| `Claim` | the claim sentence alone — no evidence, no paper title | the cross-paper kNN graph, and claim pairing for contradiction judging |
+| `Claim` | the claim sentence, bare | the cross-paper kNN graph, and claim pairing for contradiction judging |
 | `Community` | `title + ". " + summary` — the generated summary, not its member claims | `global` and `hybrid` retrieval |
+| `Evidence` | the verbatim span | nothing yet — see below |
 
-**Not embedded:** `Evidence` spans, `Dataset` descriptions, `Paper` metadata.
+**A claim is embedded bare, and the alternative was tried.** A claim sentence
+alone is ambiguous about what it is a claim *about* — "performance degrades
+sharply on longer inputs" names neither task nor model — so the paper title and
+section were prefixed to it. That made the kNN worse. The prefix is
+near-constant within a paper and long relative to one sentence, so it dominated
+the score: four unrelated LEGALBENCH claims came back paired to the same
+LawBench claim at an identical 0.905. Bare text pairs things that are actually
+about one thing — both benchmarks excluding long-document tasks over context
+limits, two papers independently finding fine-tuning helps but does not close
+the gap to GPT-4. Context that discriminates *between* the claims in a paper
+would help; metadata shared by all of them does not.
 
-Two of those omissions shape retrieval:
+**Evidence is embedded, but no query uses it.** `hybrid` reaches a passage only
+through a community summary and then a claim, and both hops are lossy — a
+summary that does not happen to mention what a passage says makes that passage
+unreachable however well it answers the question. Searching the evidence index
+directly and unioning the two was tried, and it cut both ways: on a question the
+theme route had failed entirely it found four papers' worth of answer, but on
+questions the theme route already handled it *lost* papers. Similarity alone
+gave every direct slot to whichever paper wrote most densely on the topic — all
+five to LEGALBENCH on "which model families recur" — and those hits pushed the
+themes' cross-paper claims out of the context, costing the answer LawBench on
+Chinese legal-specific models and DeepSeek-R1 on test-time scaling. The union
+needs per-paper diversity before it is worth having; the vectors are kept so
+that work does not have to start by paying for embeddings again.
 
-- A question never matches an evidence span directly. `hybrid` reaches a passage
-  only by matching its community summary first, then walking summary → claim →
-  span. Two hops of indirection, which is why `hybrid` depends so much on
-  summary quality.
-- Dataset descriptions are reachable only through a paper that has already been
-  retrieved, so a question purely about data ("which benchmarks use Chinese
-  criminal cases?") has no direct route to them.
-
-Both are cheap to change — embed the node, add a vector index — and both are
-open rather than decided.
+**Not embedded:** `Dataset` descriptions and `Paper` metadata. A dataset is
+reachable only through a paper already retrieved, so a question purely about
+data ("which benchmarks use Chinese criminal cases?") has no direct route to
+one. With ~60 dataset nodes the ceiling is low, so this is left open.
 
 ### Algorithms and thresholds
 
@@ -367,29 +437,69 @@ cannot be located is dropped rather than stored unverified.
 neighbours by embedding cosine, **only across papers**, and only above `0.80`.
 Two claims in the same paper are already related by the paper, so within-paper
 edges would just restate its structure. The floor is high because in a topical
-corpus every claim is about the same subject: at 0.6 the graph connects
-near-arbitrary pairs and Leiden splits a structureless graph into equal blobs
-that look like communities and are not.
+corpus every claim is about the same subject; 0.75 was tried and reverted, as it
+doubled the edges to 662 and left Leiden returning two 70-claim "communities"
+drawn from nine of the ten papers.
 
-**Detecting communities** — **Leiden** (Neo4j GDS) over that graph, undirected
-and weighted by similarity, `gamma=0.6`, keeping communities of `≥4` claims.
-Set `COMMUNITY_ALGORITHM=louvain` to switch. Weighted Leiden falls back to
-unweighted on the `dendrogramManager` NPE that GDS raises on degenerate graphs.
-Detection deletes the previous generation first — without that, re-running
-stacked three generations of the same clusters and answers cited one theme
-three times as if it were three sources.
+The edge weight is the similarity **rescaled onto the surviving range**,
+`(score - 0.80) / 0.20`, not the raw cosine. Every edge is above the threshold
+by construction, so raw weights span 0.80–1.00 — near-uniform to modularity,
+which is the same as having no weights at all. Rescaled they span 0–1 and a 0.98
+pair outweighs a 0.81 pair about nine to one.
+
+Claims that link to nothing stay unlinked: 114 of 361 here, including a third of
+MultiEURLEX's. No threshold fixes that without destroying the communities, which
+is why `hybrid` retrieves chunks as well as themes.
+
+**Detecting communities** — **Leiden** (Neo4j GDS) over that graph, undirected,
+weighted, `gamma=0.6`, `randomSeed=42`, `concurrency=1`, keeping communities of
+`≥4` claims. Set `COMMUNITY_ALGORITHM=louvain` to switch. Weighted Leiden falls
+back to unweighted on the `dendrogramManager` NPE that GDS raises on degenerate
+graphs.
+
+*Seeded and single-threaded* because GDS only guarantees a reproducible
+partition at concurrency 1. Unseeded, two runs over the identical 281 edges kept
+126 and 247 claims — the ones that changed hands fell either side of the
+four-member minimum. That swing was larger than any effect being measured, which
+made every before/after comparison meaningless.
+
+*Hierarchical.* Leiden merges bottom-up and only its final level used to be
+read — on ten papers that was one 89-claim community spanning nine of them.
+Every level is now kept except the fragmentary bottom and the degenerate top,
+giving 16 fine themes and 7 broad ones here. This is why `gamma` matters much
+less than it did: coarse views come from the levels above, not from tuning one
+number, and Leiden adds levels by itself as the corpus grows.
+
+*Idempotent.* Each community stores a fingerprint of its exact claim set. Same
+fingerprint on a re-run, the summary and its embedding survive; different, they
+are regenerated. Detection used to delete everything first, so every run cost a
+full re-summarisation and an interrupted one left the graph worse than it found
+it.
 
 **Pairing claims to judge for contradiction** — cross-paper cosine `≥0.78`,
 at most `200` pairs. Measured on this corpus: 0.70 gives 500+ candidates
 (the cap), 0.78 gives 38, 0.85 gives 1.
 
-**Retrieval** — Neo4j vector search, `top_k=5`, over chunks (`local`, `plain`)
-or community summaries (`global`, `hybrid`).
+**Retrieval** — Neo4j vector search, `top_k=5`, over chunks (`plain`, `local`,
+and the second half of `hybrid`) or community summaries (`global`, `hybrid`).
+The two hierarchy levels share one index, so the graph modes over-fetch `4x`
+and filter to their level, then trim back to `top_k` — the client library
+applies its own `LIMIT` before the retrieval query runs.
 
 **Concurrency** — `EXTRACT_CONCURRENCY=8` threads for the evidence, verify and
-summary passes. The sub-claim pass is deliberately sequential so each chunk
-sees the claims found before it; it is the slowest pass as a result
-(216s of LegalBench's 354s).
+summary passes. The sub-claim and dataset passes are deliberately sequential so
+each step sees what was found before it.
+
+**Token budgets** — `LLM_MAX_TOKENS=32000` for extraction, where a truncated
+structured reply is discarded whole, but short replies ask for less: community
+summaries request `2000`. The budget is *reserved*, not billed by use — the same
+summary-sized call took 8.9s at 32000 and 0.2s at 800.
+
+**Timeouts** — `LLM_TIMEOUT=120` is passed to the client, but that is a
+per-socket-operation timeout: a server that trickles bytes resets it forever.
+One dataset call sat blocked for sixteen minutes with no error and no retry. So
+every structured call also runs under a wall-clock deadline of `3x` that,
+enforced from outside the client.
 
 ### Libraries
 
@@ -402,5 +512,13 @@ entity-resolution library — that layer was removed.
 
 ## Demo corpus
 
-Six open-access AI-and-law papers; see `data/papers/SOURCES.md`. PDFs are not
+Ten open-access AI-and-law papers; see `data/papers/SOURCES.md`. PDFs are not
 committed. Comparison runs are saved under `data/comparisons/`.
+
+The first six all evaluate LLMs on legal benchmarks, and that homogeneity was
+itself a finding: nothing contradicted anything, and communities had little to
+separate. The next four were chosen for spread rather than closeness — contract
+clause extraction (CUAD), judgment prediction on ECHR cases, multilingual
+zero-shot transfer over EU law (MultiEURLEX), and dataset curation and
+responsible filtering (Pile of Law). Three of them predate or sidestep the LLM
+framing entirely, and that is where the first real disagreement came from.

@@ -120,12 +120,19 @@ class GraphStore:
     def build_claim_graph(self, k: int = 6, min_similarity: float = 0.80) -> int:
         """Link each claim to its nearest cross-paper neighbours.
 
-        0.80 is high on purpose. Every claim in a topical corpus is about the
-        same subject, so at 0.6 the graph connects near-arbitrary pairs and
-        Leiden partitions a structureless graph into equal blobs that look like
-        communities and are not. At 0.80 only 27 of 200 edges survive and 27 of
-        90 claims stay connected — fewer, but each edge is a pair of claims that
-        actually argue the same thing.
+        0.80 is high on purpose, and 0.75 was tried and reverted. Every paper
+        here is about LLMs and law, so at 0.75 the vector step called almost
+        everything related: 662 edges instead of 281, and Leiden then returned
+        two 70-plus-claim "communities" drawn from nine of the ten papers each,
+        titled "Legal-LLM Evaluation" and "Legal-LLM Benchmarking" — one blob
+        cut in half. Coverage rose and meaning fell.
+
+        The lesson is that in a single-domain corpus broad connectedness is
+        real, not a threshold artefact, so the vector step has to insist on
+        specificity. What that leaves unconnected is a genuine cost — a third
+        of MultiEURLEX's claims reach no community — and the answer to that is
+        to stop making community membership the only route into an answer,
+        which is why `hybrid` also retrieves chunks directly.
         """
         row = self.read_one(cypher.BUILD_CLAIM_GRAPH, k=k, min_similarity=min_similarity)
         created = row["created"] if row else 0
@@ -186,6 +193,11 @@ class GraphStore:
         row = self.read_one(cypher.CLEAR_COMMUNITIES)
         return row["removed"] if row else 0
 
+    def prune_communities(self, ids: list[str]) -> int:
+        """Delete communities this run did not produce, keeping the rest."""
+        row = self.read_one(cypher.PRUNE_COMMUNITIES, ids=ids)
+        return row["removed"] if row else 0
+
     def write_communities(self, rows: list[dict], algorithm: str) -> None:
         if rows:
             self.write(cypher.WRITE_COMMUNITIES, rows=rows, algorithm=algorithm)
@@ -204,11 +216,19 @@ class GraphStore:
             community_id=community_id, title=title, summary=summary, key_themes=key_themes,
         )
 
+    def delete_paper_content(self, paper_id: str) -> None:
+        """Drop one paper's sections, chunks, claims, evidence and datasets."""
+        self.write(cypher.DELETE_PAPER_CONTENT, paper_id=paper_id)
+
     # ----------------------------------------------------------- embeddings
 
     def pending_embeddings(self, label: str, limit: int) -> list[dict]:
         query, _ = cypher.EMBED_TARGETS[label]
         return self.read(query, limit=limit)
+
+    def clear_label_embeddings(self, label: str) -> None:
+        """Drop one label's vectors so the next `embed` regenerates them."""
+        self.write(cypher.CLEAR_LABEL_EMBEDDINGS.format(label=label))
 
     def write_embeddings(self, label: str, rows: list[dict]) -> None:
         _, id_prop = cypher.EMBED_TARGETS[label]

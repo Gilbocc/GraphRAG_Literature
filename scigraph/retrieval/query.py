@@ -2,7 +2,8 @@
 
 local  — specific papers, methods, datasets, claims (chunk vectors)
 global — corpus-wide themes (community summary vectors)
-hybrid — community summaries for framing, claim/evidence detail for grounding
+hybrid — community summaries for framing and cross-paper reach, plus the
+         nearest chunks, so an answer does not depend on community membership
 """
 
 from __future__ import annotations
@@ -13,14 +14,24 @@ from typing import Literal
 import neo4j
 from neo4j_graphrag.generation import GraphRAG, RagTemplate
 from neo4j_graphrag.retrievers import VectorCypherRetriever
+from neo4j_graphrag.types import RetrieverResultItem
 
 from ..config import Config
 from ..graph.cypher import GLOBAL_QUERY, HYBRID_QUERY, LOCAL_QUERY
+from .baseline import PLAIN_QUERY
 from ..llm.openrouter import embedder, graphrag_llm
 
 log = logging.getLogger(__name__)
 
 Mode = Literal["local", "global", "hybrid"]
+
+
+class _Answer:
+    """What GraphRAG.search returns, for the one mode assembled here."""
+
+    def __init__(self, answer: str, retriever_result=None):
+        self.answer = answer
+        self.retriever_result = retriever_result
 
 
 CITATION_RULES = """\
@@ -82,20 +93,57 @@ Question:
 Answer, then a Sources section listing each paper, section and page you used:
 """
 
-# --- local: chunks, plus the entities and claims grounded in them -------------
 MODES: dict[str, tuple[str, str]] = {
     "local": ("chunk_embeddings", LOCAL_QUERY),
     "global": ("community_embeddings", GLOBAL_QUERY),
     "hybrid": ("community_embeddings", HYBRID_QUERY),
 }
 
+# Both hierarchy levels share one vector index, so without a filter a 9-claim
+# theme and a 53-claim one compete on cosine alone — and a level-2 community
+# that merged nothing is a byte-for-byte duplicate of its level-1 child, so the
+# same claims arrived twice under two names. Splitting them gives each mode the
+# granularity it is for: global answers corpus-wide questions from the broad
+# level, hybrid wants specific themes and gets its breadth from chunks anyway.
+LEVEL_FOR_MODE = {"global": "broad", "hybrid": "fine"}
 
-def build_rag(driver: neo4j.Driver, cfg: Config, mode: Mode) -> GraphRAG:
+# The library LIMITs to top_k before the retrieval query runs, so the level
+# filter would otherwise shrink the result set rather than select within it.
+LEVEL_OVERFETCH = 4
+
+
+def _levels(driver: neo4j.Driver, cfg: Config) -> dict[str, int]:
+    """The finest and broadest community levels present in the graph."""
+    with driver.session(database=cfg.neo4j_database) as session:
+        found = sorted(r["level"] for r in session.run(
+            "MATCH (c:Community) WHERE c.level IS NOT NULL "
+            "RETURN DISTINCT c.level AS level"))
+    if not found:
+        return {"fine": 0, "broad": 0}
+    return {"fine": found[0], "broad": found[-1]}
+
+
+def build_rag(driver: neo4j.Driver, cfg: Config, mode: Mode, top_k: int = 5) -> GraphRAG:
     if mode not in MODES:
         raise ValueError(f"mode must be one of {sorted(MODES)}, got {mode!r}")
     index_name, retrieval_query = MODES[mode]
+    if mode in LEVEL_FOR_MODE:
+        # The candidate pool is over-fetched so the level filter has something
+        # to select from; the query trims back to the caller's top_k itself,
+        # because $top_k here is the inflated number.
+        retrieval_query = retrieval_query.format(
+            level=_levels(driver, cfg)[LEVEL_FOR_MODE[mode]], limit=top_k)
 
+    # Without a formatter the retriever hands the LLM `str(record)` — the
+    # Python repr of a neo4j Record: `<Record info='--- THEME ...\n...'>`, with
+    # every newline escaped to a literal backslash-n. The theme blocks are
+    # built with deliberate line structure, one quotation per line followed by
+    # its CITE AS, and all of it arrived as a single escaped string inside a
+    # wrapper. The prompt had a rule telling the model not to quote record
+    # syntax back, which treated the symptom.
     retriever = VectorCypherRetriever(
+        result_formatter=lambda record: RetrieverResultItem(
+            content=record["info"]),
         driver=driver,
         index_name=index_name,
         retrieval_query=retrieval_query,
@@ -110,6 +158,35 @@ def build_rag(driver: neo4j.Driver, cfg: Config, mode: Mode) -> GraphRAG:
     return GraphRAG(retriever=retriever, llm=graphrag_llm(cfg), prompt_template=template)
 
 
+def _nearest_chunks(driver: neo4j.Driver, cfg: Config, question: str, top_k: int) -> str:
+    """The plain-RAG half of hybrid: passages matched against the question.
+
+    Community membership is not universal and cannot be made so. A claim joins
+    a community only if it is close enough to a claim in another paper, and in
+    a single-domain corpus that threshold has to stay strict or the communities
+    stop meaning anything — so a paper that argues something genuinely its own
+    is exactly the paper least likely to be in one. Two of ten papers reached
+    no community at all.
+
+    Retrieving chunks alongside the themes removes that dependency: the graph
+    contributes cross-paper structure where it has any, and where it has none
+    the answer still finds the passage.
+    """
+    vector = embedder(cfg).embed_query(question)
+    with driver.session(database=cfg.neo4j_database) as session:
+        rows = list(session.run(PLAIN_QUERY, embedding=vector, top_k=top_k))
+    if not rows:
+        return ""
+    passages = "\n\n".join(
+        f"--- PASSAGE (similarity {r['score']:.3f}) ---\n"
+        f"CITE AS: [{r['paper']}, {r['section']}, p.{r['page_start']}]\n"
+        f"{r['text']}"
+        for r in rows
+    )
+    return ("--- PASSAGES MATCHING THE QUESTION DIRECTLY (quotable) ---\n"
+            + passages)
+
+
 def ask(
     driver: neo4j.Driver,
     cfg: Config,
@@ -118,9 +195,23 @@ def ask(
     top_k: int = 5,
     return_context: bool = False,
 ):
-    rag = build_rag(driver, cfg, mode)
-    return rag.search(
-        query_text=question,
-        retriever_config={"top_k": top_k},
-        return_context=return_context,
-    )
+    rag = build_rag(driver, cfg, mode, top_k=top_k)
+    fetch = top_k * LEVEL_OVERFETCH if mode in LEVEL_FOR_MODE else top_k
+    if mode != "hybrid":
+        return rag.search(
+            query_text=question,
+            retriever_config={"top_k": fetch},
+            return_context=return_context,
+        )
+
+    # Two indexes, which one retriever cannot span: themes from the community
+    # index, passages from the chunk index, assembled into one context.
+    themes = rag.retriever.search(query_text=question, top_k=fetch)
+    context = "\n\n".join(item.content for item in themes.items)
+    chunks = _nearest_chunks(driver, cfg, question, top_k)
+    if chunks:
+        context = f"{context}\n\n{chunks}"
+    answer = graphrag_llm(cfg).invoke(
+        RAG_TEMPLATE.format(context=context, query_text=question, examples="")
+    ).content
+    return _Answer(answer, context if return_context else None)

@@ -71,6 +71,22 @@ class DatasetDetail(BaseModel):
     """
 
     name: str = Field(description="The dataset as the paper names it.")
+    # Datasets are read section by section, and a paper names the same one
+    # differently as it goes -- "CUAD", "the Contract Understanding Atticus
+    # Dataset", "our dataset". Reconciliation has to happen while the model can
+    # still see both names: matching normalized strings afterwards would leave
+    # one dataset as three nodes, each holding a third of what the paper says
+    # about it, which is the opposite of the point. A section that adds detail
+    # returns the dataset again with every field filled in, and that record
+    # replaces the earlier one -- the model merges, because only the model can
+    # see both what is already known and what this section adds.
+    existing_index: int = Field(
+        default=-1,
+        description=(
+            "Index into the datasets already found, if this section describes "
+            "one of them under any name or abbreviation. -1 if it is new."
+        ),
+    )
     introduced_here: bool = Field(
         description="True if this paper builds or releases it, False if it reuses it."
     )

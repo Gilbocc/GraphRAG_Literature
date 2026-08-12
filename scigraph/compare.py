@@ -44,8 +44,9 @@ def compare(
     lines = [
         f"# Retrieval comparison — {stamp}",
         "",
-        f"Model `{cfg.llm_model}`, embeddings `{cfg.embedding_model}`, "
-        f"top_k={top_k}.",
+        f"Answering model `{cfg.answer_model}` at temperature "
+        f"{cfg.query_temperature}, embeddings `{cfg.embedding_model}`, "
+        f"top_k={top_k}. Extraction ran on `{cfg.llm_model}`.",
         "",
         "- **plain** — nearest chunks only, no graph. The control.",
         "- **local** — nearest chunks, plus the claims each one grounds.",

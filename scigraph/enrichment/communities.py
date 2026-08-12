@@ -7,6 +7,7 @@ than document structure.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from concurrent.futures import ThreadPoolExecutor
 
@@ -21,6 +22,12 @@ from ..models import CommunitySummary
 log = logging.getLogger(__name__)
 
 GRAPH_NAME = "conceptGraph"
+
+# A summary is a title, a paragraph and a few themes. Asking for the pipeline's
+# 32000-token default made each call reserve capacity it never used, and this
+# provider queues on the reservation: the same call took 8.9s at 32000 and 0.2s
+# at 800. Eight of them at once turned that into 70-87s each.
+SUMMARY_MAX_TOKENS = 2000
 
 
 # Members plus the claims and papers that touch them: the summarizer's context.
@@ -46,13 +53,52 @@ Papers involved:
 """
 
 
+def _fingerprint(members: list[str]) -> str:
+    """Identity of a community's membership, order-independent.
+
+    A summary is written from one exact set of claims and is only true of that
+    set, so this is what decides whether it survives a re-run rather than the
+    community id, which is stable even when membership shifts underneath it.
+    """
+    return hashlib.sha256("|".join(sorted(members)).encode()).hexdigest()[:16]
+
+
+def _usable_levels(depth: int) -> list[int]:
+    """Which levels of the dendrogram are worth keeping.
+
+    Neither end is. Level 0 is what Leiden starts from — mostly pairs and
+    singletons, and at ten papers it left over half the linked claims in groups
+    too small to keep. The final level is where merging stopped, which on a
+    single-domain corpus is close to "everything": one 89-claim community drawn
+    from nine of ten papers.
+
+    The middle is where the themes are, and taking it by position rather than
+    by size means this does not need retuning as the corpus grows — Leiden adds
+    levels as the graph gets bigger, and the fragmentary bottom and degenerate
+    top stay at the ends.
+    """
+    if depth <= 1:
+        return [0]
+    if depth == 2:
+        return [0]
+    return list(range(1, depth - 1))
+
+
 def _drop_graph(gds: GraphDataScience) -> None:
     if gds.graph.exists(GRAPH_NAME)["exists"]:
         gds.graph.drop(GRAPH_NAME)
 
 
 def detect_communities(store: GraphStore, cfg: Config) -> dict[str, int]:
-    """Project Claim-[:RELATED_CLAIM]-Claim and run Leiden or Louvain."""
+    """Build the cross-paper claim graph, then run Leiden or Louvain over it.
+
+    The kNN is rebuilt here rather than at the end of ingest because it reads
+    claim embeddings, and ingest runs before `embed`. Built there it silently
+    skipped every claim the ingest had just created: four new papers added 128
+    claims and none of them could join a community, so detection reported "5
+    communities over 361 claims" while actually partitioning the 233 older ones.
+    """
+    store.build_claim_graph()
     gds = GraphDataScience(store.driver, database=store.database)
     algorithm = cfg.community_algorithm.lower()
     if algorithm not in {"leiden", "louvain"}:
@@ -72,9 +118,24 @@ def detect_communities(store: GraphStore, cfg: Config) -> dict[str, int]:
             return {"communities": 0, "nodes": 0}
 
         runner = gds.leiden if algorithm == "leiden" else gds.louvain
+        # Seeded and single-threaded, because GDS only guarantees a
+        # reproducible partition at concurrency 1. Unseeded, Leiden randomises
+        # node order and settles in a different local optimum each run: on this
+        # graph two runs over the identical 281 edges kept 126 and 247 claims,
+        # because the ones that changed hands fell either side of
+        # MIN_COMMUNITY_SIZE and communities under it are discarded. That made
+        # every before/after comparison of a parameter change unreadable — the
+        # run-to-run swing was larger than the effect being measured.
+        params = {"gamma": cfg.community_resolution,
+                  "randomSeed": cfg.community_seed, "concurrency": 1,
+                  # Leiden merges bottom-up and we used to read only where it
+                  # stopped. That final level is the whole corpus barely
+                  # divided; the themes worth retrieving are the ones it passed
+                  # through on the way.
+                  "includeIntermediateCommunities": True}
         try:
             result = runner.stream(graph, relationshipWeightProperty="weight",
-                                   gamma=cfg.community_resolution)
+                                   **params)
         except ClientError as exc:
             # GDS 2.x throws an NPE from LeidenResult.dendrogramManager() when the
             # weighted run converges in zero levels, which happens on very small or
@@ -86,36 +147,44 @@ def detect_communities(store: GraphStore, cfg: Config) -> dict[str, int]:
                 "retrying unweighted. Add more papers for weighted communities.",
                 algorithm,
             )
-            result = runner.stream(graph, gamma=cfg.community_resolution)
+            result = runner.stream(graph, **params)
 
         node_ids = result["nodeId"].tolist()
         keys = [gds.util.asNode(nid)["claim_id"] for nid in node_ids]
-        communities = result["communityId"].tolist()
+        levels = [list(ids) for ids in result["intermediateCommunityIds"].tolist()]
+        depth = max(len(x) for x in levels)
 
-        grouped: dict[int, list[str]] = {}
-        for key, community in zip(keys, communities):
-            grouped.setdefault(int(community), []).append(key)
+        rows: list[dict] = []
+        for level in _usable_levels(depth):
+            grouped: dict[int, list[str]] = {}
+            for key, ids in zip(keys, levels):
+                grouped.setdefault(int(ids[min(level, len(ids) - 1)]), []).append(key)
+            kept = {c: m for c, m in grouped.items()
+                    if len(m) >= cfg.min_community_size}
+            log.info("  level %d: %d communities over %d claims (of %d groups)",
+                     level, len(kept), sum(len(m) for m in kept.values()), len(grouped))
+            rows += [
+                {
+                    "community_id": f"{algorithm}-L{level}-{cid}",
+                    "level": level,
+                    "size": len(members),
+                    "members": members,
+                    "members_hash": _fingerprint(members),
+                }
+                for cid, members in kept.items()
+            ]
 
-        rows = [
-            {
-                "community_id": f"{algorithm}-0-{cid}",
-                "size": len(members),
-                "members": members,
-            }
-            for cid, members in grouped.items()
-            if len(members) >= cfg.min_community_size
-        ]
-
-        log.info("Cleared %d communities from the previous run",
-                 store.clear_communities())
+        removed = store.prune_communities([r["community_id"] for r in rows])
         store.write_communities(rows, algorithm)
+        kept_summaries = len(rows) - len(store.unsummarized_communities())
+        log.info("%d communities written, %d dropped, %d summaries reused",
+                 len(rows), removed, kept_summaries)
 
         log.info(
-            "%s produced %d communities (>= %d members) over %d concepts",
-            algorithm,
-            len(rows),
-            cfg.min_community_size,
-            graph.node_count(),
+            "%s produced %d communities across %d levels (>= %d members) "
+            "over %d claims",
+            algorithm, len(rows), len(_usable_levels(depth)),
+            cfg.min_community_size, graph.node_count(),
         )
         return {"communities": len(rows), "nodes": graph.node_count()}
     finally:
@@ -149,7 +218,8 @@ def summarize_communities(store: GraphStore, cfg: Config, client=None) -> int:
             papers="\n".join(f"- {p}" for p in context["papers"] if p) or "(none)",
         )
         try:
-            return community_id, llm.parse(SUMMARY_SYSTEM, user, CommunitySummary)
+            return community_id, llm.parse(SUMMARY_SYSTEM, user, CommunitySummary,
+                                           max_tokens=SUMMARY_MAX_TOKENS)
         except Exception as exc:
             log.error("Summary failed for %s: %s", community_id, exc)
             return None

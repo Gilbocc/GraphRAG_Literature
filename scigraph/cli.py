@@ -26,18 +26,46 @@ from .llm import StructuredLLM, neo4j_driver, raw_client
 from .retrieval import ask, plain_rag
 
 
-def _setup_logging(verbose: bool) -> None:
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
-        format="%(levelname)s %(name)s: %(message)s",
+LOG_FILE = Path("data/logs/scigraph.log")
+
+
+def _setup_logging(verbose: bool, log_file: Path = LOG_FILE) -> None:
+    """Log to the console and, always, to a file that is flushed per line.
+
+    A long run's progress must be readable *while it runs*, from a different
+    shell than the one that started it. Piping the console output through
+    anything that buffers — `tail`, `head`, a pager — silently defeats that:
+    an ingest ran 30 minutes emitting timing lines into a pipe that held every
+    one of them until the process exited, which is indistinguishable from a
+    hang. The file handler does not care how the caller redirected stdout.
+    """
+    level = logging.DEBUG if verbose else logging.INFO
+    formatter = logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s: %(message)s", datefmt="%H:%M:%S"
     )
+
+    console = logging.StreamHandler()
+    console.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    to_file = logging.FileHandler(log_file, mode="a")
+    to_file.setFormatter(formatter)
+    to_file.flush = lambda *_, **__: to_file.stream.flush()  # noqa: E731
+
+    logging.basicConfig(level=level, handlers=[console, to_file], force=True)
     for noisy in ("neo4j", "httpx", "neo4j.notifications"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+    logging.getLogger(__name__).info(
+        "--- %s ---", " ".join(sys.argv[1:]) or "scigraph")
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="scigraph", description=__doc__)
     parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("--log-file", type=Path, default=LOG_FILE,
+                        help=f"append logs here as well as to the console "
+                             f"(default {LOG_FILE}); always line-flushed, so a "
+                             f"background run stays readable with `tail -f`")
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("init", help="Create constraints and vector indexes")
@@ -45,7 +73,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p_ingest = sub.add_parser("ingest", help="Parse PDFs and extract into the graph")
     p_ingest.add_argument("directory", type=Path)
 
-    sub.add_parser("embed", help="Embed chunks, claims and community summaries")
+    p_embed = sub.add_parser("embed", help="Embed chunks, claims, evidence and community summaries")
+    p_embed.add_argument(
+        "--redo", nargs="+", metavar="LABEL", default=[],
+        help="Drop these labels' vectors first, for when the embedded text changed "
+             "(e.g. --redo Claim). Embedding is otherwise incremental and would skip them.")
 
     p_comm = sub.add_parser("communities", help="Detect communities and summarize them")
     p_comm.add_argument("--skip-summaries", action="store_true")
@@ -94,6 +126,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p_sg.add_argument("--min-citers", type=int, default=2)
     p_sg.add_argument("--limit", type=int, default=20)
 
+    p_forget = sub.add_parser(
+        "forget", help="Delete one paper's extracted content so it can be re-ingested")
+    p_forget.add_argument("paper_id", help="e.g. arxiv:2103.06268 (see `stats`)")
+
     sub.add_parser("stats", help="Show node and relationship counts")
     sub.add_parser("reset-vectors",
                    help="Drop vector indexes and embeddings (after changing dimensions)")
@@ -128,7 +164,7 @@ def _print_disagreements(rows: list[dict]) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    _setup_logging(args.verbose)
+    _setup_logging(args.verbose, args.log_file)
 
     cfg = load_config()
 
@@ -173,7 +209,14 @@ def main(argv: list[str] | None = None) -> int:
                 total += _describe_datasets(store, parsed, llm)
             print(f"Datasets described: {total}")
 
+        elif args.command == "forget":
+            store.delete_paper_content(args.paper_id)
+            print(f"Cleared extracted content for {args.paper_id}")
+
         elif args.command == "embed":
+            for label in args.redo:
+                store.clear_label_embeddings(label)
+                print(f"Cleared {label} embeddings")
             print(f"Embedded: {embed_all(store, cfg, raw_client(cfg))}")
 
         elif args.command == "communities":
