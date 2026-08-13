@@ -267,62 +267,39 @@ UNWIND $claims AS c
 # no resolution step in between. Pairing on shared nodes found nothing, because
 # no two papers ever landed on the same node.
 # Two claims are worth comparing when they say near enough the same thing and
-# come from different papers. Pairing used to require a shared measurement
-# artifact; that machinery is gone with the measurements, and it never produced
-# a comparable pair anyway — the papers evaluate different models on different
-# data, so the artifacts almost never met.
-CLAIM_CANDIDATE_PAIRS = """
-MATCH (pa:Paper)-[:MAKES_CLAIM]->(a:Claim)
-MATCH (pb:Paper)-[:MAKES_CLAIM]->(b:Claim)
-WHERE a.paper_id < b.paper_id
-  AND coalesce(a.status, '') <> 'unsupported'
-  AND coalesce(b.status, '') <> 'unsupported'
-  AND a.embedding IS NOT NULL AND b.embedding IS NOT NULL
-  AND NOT EXISTS { (a)-[:CONTRADICTS|SUPPORTS|REFINES|UNRELATED_TO]-(b) }
-WITH a, b, pa, pb, vector.similarity.cosine(a.embedding, b.embedding) AS similarity
-WHERE similarity >= $min_similarity
-// Datasets both papers work on, so a judge can tell a real disagreement from
-// two papers measuring different things.
-OPTIONAL MATCH (pa)-[:USES_DATASET]->(d:Dataset)<-[:USES_DATASET]-(pb)
-WITH a, b, pa, pb, similarity, collect(DISTINCT d.name)[..8] AS shared_specific
-// The spans behind each claim: what the paper actually put in front of the
-// reader, tables included.
-WITH a, b, pa, pb, similarity, shared_specific,
-     [(a)-[:SUPPORTED_BY]->(e:Evidence) | left(e.text, 400)][..4] AS a_backing,
-     [(b)-[:SUPPORTED_BY]->(e:Evidence) | left(e.text, 400)][..4] AS b_backing
-RETURN a.claim_id AS a_id, a.text AS a_text, pa.title AS a_paper,
-       a.section AS a_section, a.page_start AS a_page, a_backing,
-       b.claim_id AS b_id, b.text AS b_text, pb.title AS b_paper,
-       b.section AS b_section, b.page_start AS b_page, b_backing,
-       shared_specific AS shared, shared_specific, similarity
-ORDER BY similarity DESC
-LIMIT $limit
-"""
+# NOTE: the LLM pass that judged claim pairs (CONTRADICTS / SUPPORTS / REFINES)
+# was removed. Across three corpus sizes it judged every candidate UNRELATED,
+# and the one real disagreement this corpus contains — CUAD's "a 20-fold
+# parameter increase yields ~3% AUPR" against LawBench's "scaling up the model
+# size improves performance" — sat at cosine 0.799, below the pairing floor,
+# and was surfaced by retrieval instead. RELATED_CLAIM survives: it is the kNN
+# graph community detection runs on, and has nothing to do with judging.
 
-
-WRITE_CLAIM_LINK = """
-MATCH (a:Claim {claim_id: $a_id})
-MATCH (b:Claim {claim_id: $b_id})
-MERGE (a)-[r:`__REL__`]->(b)
-SET r.rationale = $rationale,
-    r.confidence = $confidence,
-    r.similarity = $similarity,
-    r.shared_entities = $shared,
-    r.shared_artifacts = $shared_specific,
-    r.explanation = $explanation,
-    r.judged_by = $model,
-    r.judged_at = $judged_at
-"""
-
-DISAGREEMENTS = """
-MATCH (a:Claim)-[r:CONTRADICTS]->(b:Claim)
-MATCH (pa:Paper)-[:MAKES_CLAIM]->(a)
-MATCH (pb:Paper)-[:MAKES_CLAIM]->(b)
-RETURN pa.title AS paper_a, a.text AS claim_a, a.section AS section_a, a.page_start AS page_a,
-       pb.title AS paper_b, b.text AS claim_b, b.section AS section_b, b.page_start AS page_b,
-       r.rationale AS rationale, r.explanation AS explanation,
-       r.confidence AS confidence
-ORDER BY r.confidence DESC
+# Passages matched against the question directly, with no community or claim in
+# between. The first attempt at this folded the spans into `hybrid` and made it
+# worse: ranked on similarity alone, all five slots went to whichever paper
+# wrote most densely on the topic — LEGALBENCH took every one on "which model
+# families recur" — and those hits pushed the themes' cross-paper claims out of
+# the context. Two spans per paper is the fix; the route itself was never the
+# problem.
+EVIDENCE_QUERY = """
+MATCH (ev:Evidence) WHERE ev = node
+MATCH (cl:Claim)-[:SUPPORTED_BY]->(ev)
+MATCH (p:Paper)-[:MAKES_CLAIM]->(cl)
+WITH p, ev, cl, score ORDER BY score DESC
+WITH p, collect({{ev: ev, cl: cl, score: score}})[..2] AS best
+UNWIND best AS hit
+WITH p, hit.ev AS ev, hit.cl AS cl, hit.score AS score
+ORDER BY score DESC LIMIT {limit}
+RETURN '--- PASSAGE (similarity ' + toString(round(score, 3)) + ') ---\\n' +
+       '"' + left(ev.text, 900) + '"' +
+       '  \u2014\u2014 CITE AS: [' + coalesce(p.title, '?') + ', ' +
+       coalesce(ev.section, cl.section, '?') +
+       ', p.' + toString(coalesce(ev.page_start, cl.page_start)) + ']\\n' +
+       '    (what it supports, our paraphrase \u2014 do not quote: ' + cl.text +
+       ')  [' + coalesce(cl.status, 'unverified') + ']'
+       AS info
+ORDER BY score DESC
 """
 
 # ---------------------------------------------------------------- communities

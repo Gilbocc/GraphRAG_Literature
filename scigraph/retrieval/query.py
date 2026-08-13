@@ -3,7 +3,8 @@
 local  — specific papers, methods, datasets, claims (chunk vectors)
 global — corpus-wide themes (community summary vectors)
 hybrid — community summaries for framing and cross-paper reach, plus the
-         nearest chunks, so an answer does not depend on community membership
+           nearest chunks, so an answer does not depend on community membership
+evidence — the verbatim spans nearest the question, at most two per paper
 """
 
 from __future__ import annotations
@@ -17,13 +18,13 @@ from neo4j_graphrag.retrievers import VectorCypherRetriever
 from neo4j_graphrag.types import RetrieverResultItem
 
 from ..config import Config
-from ..graph.cypher import GLOBAL_QUERY, HYBRID_QUERY, LOCAL_QUERY
+from ..graph.cypher import EVIDENCE_QUERY, GLOBAL_QUERY, HYBRID_QUERY, LOCAL_QUERY
 from .baseline import PLAIN_QUERY
 from ..llm.openrouter import embedder, graphrag_llm
 
 log = logging.getLogger(__name__)
 
-Mode = Literal["local", "global", "hybrid"]
+Mode = Literal["local", "global", "hybrid", "evidence"]
 
 
 class _Answer:
@@ -97,7 +98,31 @@ MODES: dict[str, tuple[str, str]] = {
     "local": ("chunk_embeddings", LOCAL_QUERY),
     "global": ("community_embeddings", GLOBAL_QUERY),
     "hybrid": ("community_embeddings", HYBRID_QUERY),
+    "evidence": ("evidence_embeddings", EVIDENCE_QUERY),
 }
+
+# Modes whose retrieval query filters or caps its own candidates, so the caller
+# over-fetches and the query trims back to top_k itself. The client library
+# applies its LIMIT before the retrieval query runs, which would otherwise turn
+# every filter into a shrunken result set rather than a selection.
+OVERFETCH_MODES = {"global", "hybrid", "evidence"}
+OVERFETCH = 4
+
+# Five themes and five chunks. Hybrid spends roughly 70% of its context on
+# themes, which looks unbalanced and is not: rebalancing was tried both ways and
+# both lost the one cross-paper disagreement this corpus contains.
+#
+# At 3 themes the community holding CUAD's scaling claims fell out entirely.
+# At 8 chunks the themes were still present but the answer stopped using them —
+# more passages did not add depth, they displaced attention, and hybrid returned
+# the same "bigger usually helps" as every other mode. Restoring 5/5 brought the
+# CUAD result back in two consecutive runs, so this is the configuration, not a
+# coincidence.
+#
+# The passage-depth questions hybrid loses to `local` did not improve under
+# either change. That gap is real and this is not the lever for it.
+HYBRID_THEMES = 5
+HYBRID_EXTRA_CHUNKS = 0
 
 # Both hierarchy levels share one vector index, so without a filter a 9-claim
 # theme and a 53-claim one compete on cosine alone — and a level-2 community
@@ -109,7 +134,7 @@ LEVEL_FOR_MODE = {"global": "broad", "hybrid": "fine"}
 
 # The library LIMITs to top_k before the retrieval query runs, so the level
 # filter would otherwise shrink the result set rather than select within it.
-LEVEL_OVERFETCH = 4
+
 
 
 def _levels(driver: neo4j.Driver, cfg: Config) -> dict[str, int]:
@@ -127,12 +152,11 @@ def build_rag(driver: neo4j.Driver, cfg: Config, mode: Mode, top_k: int = 5) -> 
     if mode not in MODES:
         raise ValueError(f"mode must be one of {sorted(MODES)}, got {mode!r}")
     index_name, retrieval_query = MODES[mode]
-    if mode in LEVEL_FOR_MODE:
-        # The candidate pool is over-fetched so the level filter has something
-        # to select from; the query trims back to the caller's top_k itself,
-        # because $top_k here is the inflated number.
-        retrieval_query = retrieval_query.format(
-            level=_levels(driver, cfg)[LEVEL_FOR_MODE[mode]], limit=top_k)
+    if mode in OVERFETCH_MODES:
+        fmt = {"limit": HYBRID_THEMES if mode == "hybrid" else top_k}
+        if mode in LEVEL_FOR_MODE:
+            fmt["level"] = _levels(driver, cfg)[LEVEL_FOR_MODE[mode]]
+        retrieval_query = retrieval_query.format(**fmt)
 
     # Without a formatter the retriever hands the LLM `str(record)` — the
     # Python repr of a neo4j Record: `<Record info='--- THEME ...\n...'>`, with
@@ -196,7 +220,7 @@ def ask(
     return_context: bool = False,
 ):
     rag = build_rag(driver, cfg, mode, top_k=top_k)
-    fetch = top_k * LEVEL_OVERFETCH if mode in LEVEL_FOR_MODE else top_k
+    fetch = top_k * OVERFETCH if mode in OVERFETCH_MODES else top_k
     if mode != "hybrid":
         return rag.search(
             query_text=question,
@@ -208,7 +232,7 @@ def ask(
     # index, passages from the chunk index, assembled into one context.
     themes = rag.retriever.search(query_text=question, top_k=fetch)
     context = "\n\n".join(item.content for item in themes.items)
-    chunks = _nearest_chunks(driver, cfg, question, top_k)
+    chunks = _nearest_chunks(driver, cfg, question, top_k + HYBRID_EXTRA_CHUNKS)
     if chunks:
         context = f"{context}\n\n{chunks}"
     answer = graphrag_llm(cfg).invoke(

@@ -22,7 +22,7 @@ from .retrieval import ask, plain_rag
 
 log = logging.getLogger(__name__)
 
-MODES = ("plain", "local", "global", "hybrid")
+MODES = ("plain", "local", "global", "hybrid", "evidence")
 
 
 def _answer(driver: neo4j.Driver, cfg: Config, mode: str, question: str, top_k: int) -> str:
@@ -52,7 +52,9 @@ def compare(
         "- **local** — nearest chunks, plus the claims each one grounds.",
         "- **global** — community summaries only.",
         "- **hybrid** — community summaries, plus each theme's claims and the "
-        "verbatim passage behind them.",
+        "verbatim passage behind them, plus the nearest chunks.",
+        "- **evidence** — the verbatim spans nearest the question, at most two "
+        "per paper.",
         "",
     ]
 

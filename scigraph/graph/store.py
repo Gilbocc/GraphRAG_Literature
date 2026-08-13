@@ -1,6 +1,6 @@
 """GraphStore — the only place that talks to Neo4j.
 
-Callers get intention-revealing methods (`write_claims`, `candidate_claim_pairs`)
+Callers get intention-revealing methods (`write_claims`, `claims_with_evidence`)
 instead of holding Cypher and repeating session/transaction boilerplate. All
 statements live in `cypher.py`; this module executes them.
 """
@@ -146,24 +146,12 @@ class GraphStore:
         if claims:
             self.write(cypher.WRITE_CLAIMS, claims=claims)
 
-    def candidate_claim_pairs(
-        self, limit: int, min_similarity: float, min_specific: int = 1
-    ) -> list[dict]:
-        return self.read(
-            cypher.CLAIM_CANDIDATE_PAIRS,
-            limit=limit, min_similarity=min_similarity,
-            min_specific=min_specific,
-        )
-
     def suggest_papers(self, min_citers: int = 2, limit: int = 20) -> list[dict]:
         return self.read(cypher.SUGGEST_PAPERS, min_citers=min_citers, limit=limit)
 
     def write_datasets(self, rows: list[dict]) -> None:
         if rows:
             self.write(cypher.WRITE_DATASETS, rows=rows)
-
-    def write_claim_link(self, rel: str, **params: Any) -> None:
-        self.write(cypher.WRITE_CLAIM_LINK.replace("__REL__", rel), **params)
 
     def write_evidence(self, rows: list[dict]) -> None:
         if rows:
@@ -183,9 +171,6 @@ class GraphStore:
                      reason: str) -> None:
         self.write(cypher.MARK_VERDICT, claim_id=claim_id,
                    status=status, contradicts=contradicts, reason=reason)
-
-    def disagreements(self) -> list[dict]:
-        return self.read(cypher.DISAGREEMENTS)
 
     # ---------------------------------------------------------- communities
 

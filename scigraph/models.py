@@ -205,33 +205,6 @@ class ChunkSubclaims(BaseModel):
     new_claims: list[NewClaim] = Field(default_factory=list)
 
 
-ClaimRelationType = Literal["CONTRADICTS", "SUPPORTS", "REFINES", "UNRELATED"]
-
-
-class ClaimRelationJudgement(BaseModel):
-    """The LLM's verdict on how two claims from different papers relate."""
-
-    relation: ClaimRelationType = Field(
-        description=(
-            "CONTRADICTS if the claims cannot both be true as stated. "
-            "SUPPORTS if they assert compatible findings in the same direction. "
-            "REFINES if one narrows, qualifies, or scopes the other. "
-            "UNRELATED if they concern different questions."
-        )
-    )
-    rationale: str = Field(description="One sentence justifying the verdict.")
-    explanation: str = Field(
-        default="",
-        description=(
-            "For CONTRADICTS, SUPPORTS or REFINES: what specifically differs or "
-            "agrees between the two claims and their evidence — the setups "
-            "compared, the direction of each finding, and why that puts them in "
-            "this relation. Empty for UNRELATED."
-        ),
-    )
-    confidence: float = Field(ge=0.0, le=1.0, default=0.7)
-
-
 class MainClaim(BaseModel):
     """A claim the paper is actually arguing for — its thesis-level assertions."""
 

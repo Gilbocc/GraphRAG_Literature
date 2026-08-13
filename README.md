@@ -18,8 +18,7 @@ evidence for a claim some paper makes.
 (Claim)-[:SUPPORTED_BY]->(Evidence)-[:EXTRACTED_FROM]->(Chunk)
 (Paper)-[:USES_DATASET {introduced_here}]->(Dataset)
 (Claim)-[:RELATED_CLAIM {weight}]->(Claim)        // cross-paper kNN, drives communities
-(Claim)-[:IN_COMMUNITY]->(Community)
-(Claim)-[:CONTRADICTS|SUPPORTS|REFINES|UNRELATED_TO {explanation}]->(Claim)
+(Claim)-[:IN_COMMUNITY]->(Community)          // hierarchical: Community.level
 
 (Paper)-[:CITES {resolved_by}]->(Paper)           // cited works become stub Papers
 (Paper)-[:AUTHORED_BY {position}]->(Author)       // from OpenAlex
@@ -127,6 +126,7 @@ python -m scigraph ask --plain "..."      # baseline: nearest chunks, no graph
 | `local` | nearest chunks, plus the claims each grounds and the paper's datasets |
 | `global` | **broad** community themes, with the passage behind each claim |
 | `hybrid` | **fine** community themes with their passages, **plus** the nearest chunks |
+| `evidence` | the verbatim spans nearest the question, at most two per paper |
 
 Communities are hierarchical, and each mode reads the level it is for: `global`
 takes the broadest level for corpus-wide questions, `hybrid` the finest, since
@@ -140,6 +140,12 @@ it gets breadth from chunks instead. Both cite the passage, not the summary.
 | corpus-wide breadth | `global` | broadest coverage, 30 page-citations on one question |
 | "what methods exist" | `local` | reads passages closely; separated annotation from prediction where hybrid merged them |
 | single-paper factual | `plain` | its whole context is passages |
+
+`evidence` is the newest and narrowest: five spans is 2-3 KB of context against
+`plain`'s 20 KB, so every line it gets is a verified quotable span and there are
+too few of them to answer a broad question. It was the thinnest mode on four of
+five questions. `top_k` means something different for spans than for chunks and
+has not been retuned.
 
 `hybrid` is the default worth reaching for, because synthesis across papers is
 what the graph is for, but it spends about 70% of its context on themes and 30%
@@ -237,7 +243,6 @@ python -m scigraph pipeline data/papers      # everything
 python -m scigraph ingest /path/to/one-paper/
 python -m scigraph embed
 python -m scigraph communities               # claim graph, levels, summaries, embeddings
-python -m scigraph link-claims
 
 # an interrupted ingest leaves a half-extracted paper; re-running does not
 # repair it, because claim ids hash the claim text and a re-worded claim lands
@@ -320,10 +325,13 @@ Known gaps, roughly by how much they matter:
 - **A third of claims reach no community** — 114 of 361, because they link to
   nothing above the 0.80 floor. Lowering it destroys the communities instead, so
   `hybrid` covers those papers through chunks rather than themes.
-- **`link-claims` finds no contradictions.** The one real cross-paper
-  disagreement in this corpus — CUAD against LawBench on whether scale helps —
-  sits at cosine 0.799, just under the pairing threshold, and was surfaced by
-  retrieval rather than by the linker. The pass has yet to earn its cost.
+- **Nothing judges claims against each other any more.** An LLM pass used to
+  label cross-paper pairs `CONTRADICTS` / `SUPPORTS` / `REFINES`; it called
+  every candidate `UNRELATED` across three corpus sizes and was deleted. The one
+  real disagreement here — CUAD against LawBench on whether scale helps — sits
+  at cosine 0.799, under the pairing floor, and `hybrid` surfaced it from
+  retrieval instead. Contradiction is currently something a reader notices in an
+  answer, not something the graph records.
 - **Run-to-run variance is large** — the same paper gave 23 and 54 claims on
   different runs. Pass 2 being sequential compounds an early divergence.
   Community *detection* is now seeded and reproducible; extraction is not.

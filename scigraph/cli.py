@@ -16,8 +16,6 @@ from .enrichment import (
     detect_communities,
     embed_all,
     enrich,
-    link_claims,
-    list_disagreements,
     summarize_communities,
 )
 from .graph import GraphStore
@@ -86,15 +84,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p_bib.add_argument("--include-stubs", action="store_true",
                        help="also resolve cited-but-not-ingested papers")
 
-    p_link = sub.add_parser("link-claims", help="Judge and link claim pairs across papers")
-    p_link.add_argument("--limit", type=int, default=200)
-    p_link.add_argument("--min-similarity", type=float, default=0.78)
-
-    sub.add_parser("disagreements", help="List contradicting claims across papers")
-
     p_ask = sub.add_parser("ask", help="Query the graph")
     p_ask.add_argument("question")
-    p_ask.add_argument("--mode", choices=["local", "global", "hybrid"], default="local")
+    p_ask.add_argument("--mode",
+                       choices=["local", "global", "hybrid", "evidence"],
+                       default="local")
     p_ask.add_argument("--top-k", type=int, default=5)
     p_ask.add_argument("--show-context", action="store_true")
     p_ask.add_argument("--plain", action="store_true",
@@ -149,17 +143,6 @@ def _print_stats(store: GraphStore) -> None:
         print(f"Embedded nodes: {coverage['embedded']} | "
               f"communities summarized: {coverage['summarized']}")
 
-
-def _print_disagreements(rows: list[dict]) -> None:
-    if not rows:
-        print("No contradictions found. Run 'link-claims' first.")
-        return
-    for row in rows:
-        print(f"\n[conf {row['confidence']:.2f}] {row['rationale']}")
-        print(f"  A: {row['claim_a']}")
-        print(f"     -- {row['paper_a']}, {row['section_a']}, p.{row['page_a']}")
-        print(f"  B: {row['claim_b']}")
-        print(f"     -- {row['paper_b']}, {row['section_b']}, p.{row['page_b']}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -227,13 +210,6 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "biblio":
             print(f"OpenAlex: {enrich(store, cfg, include_stubs=args.include_stubs)}")
 
-        elif args.command == "link-claims":
-            print(f"Claim links: "
-                  f"{link_claims(store, cfg, limit=args.limit, min_similarity=args.min_similarity)}")
-
-        elif args.command == "disagreements":
-            _print_disagreements(list_disagreements(store))
-
         elif args.command == "ask":
             if args.plain:
                 print(plain_rag(store.driver, cfg, args.question, top_k=args.top_k))
@@ -250,7 +226,6 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Summarized {summarize_communities(store, cfg)} communities")
             print(f"Embedded: {embed_all(store, cfg, raw_client(cfg))}")
             print(f"OpenAlex: {enrich(store, cfg)}")
-            print(f"Claim links: {link_claims(store, cfg)}")
 
         elif args.command == "compare":
             from .compare import compare
